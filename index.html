@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+  <title>Address to Constituency Lookup</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/bluebird/3.5.3/bluebird.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/popper.js/1.14.3/umd/popper.min.js" integrity="sha384-ZMP7rVo3mIykV+2+9J3UJ46jBk0WLaUAdn689aCwoqbBJiSnjAK/l8WvCWPIPm49" crossorigin="anonymous"></script>
+  <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.1.3/js/bootstrap.min.js" integrity="sha384-ChfqqxuZUCnJSK3+MXmPNIyE6ZbWh2IMqE241rYiqJxyMiZ6OW/JmZQ5stwEULTy" crossorigin="anonymous"></script>
+  <script>
+  var BPromise = Promise.noConflict();
+  var DELAY = 500;
+
+  //
+  // Google Maps API
+  //
+  var googleMaps;
+  function initialiseGoogleMaps() {
+    googleMaps = {};
+
+    googleMaps.placesService = new google.maps.places.PlacesService(
+      $("#placesServiceContainer")[0]
+    );
+
+    function statusIsError(status) {
+      var STATUS = google.maps.places.PlacesServiceStatus;
+      return (
+        status === STATUS.OVER_QUERY_LIMIT ||
+        status === STATUS.REQUEST_DENIED ||
+        status === STATUS.INVALID_REQUEST ||
+        status === STATUS.UNKNOWN_ERROR
+      );
+    }
+
+    googleMaps.findPlaceFromQueryAsync = function(request) {
+      return new BPromise(function(resolve, reject) {
+        function receiveFindPlaceFromQueryResponse(result, status) {
+          if (statusIsError(status)) {
+            reject(new Error(status));
+          } else {
+            resolve([result, status]);
+          }
+        }
+        googleMaps.placesService.findPlaceFromQuery(
+          request,
+          receiveFindPlaceFromQueryResponse
+        );
+      });
+    };
+
+    googleMaps.getDetailsAsync = function(request) {
+      return new BPromise(function(resolve, reject) {
+        function receiveGetDetailsResponse(result, status) {
+          if (statusIsError(status)) {
+            reject(new Error(status));
+          } else {
+            resolve([result, status]);
+          }
+        }
+        googleMaps.placesService.getDetails(request, receiveGetDetailsResponse);
+      });
+    };
+  }
+
+  //
+  // Postcodes.io API
+  //
+  function findConstituencyForPostcode(postcode) {
+    return new BPromise(function(resolve, reject) {
+      var encodedPostcode = encodeURIComponent(postcode);
+      $.get("https://api.postcodes.io/postcodes/" + encodedPostcode)
+        .done(function(response, textStatus) {
+          if (textStatus === "success" && response.result) {
+            resolve(response.result.parliamentary_constituency);
+          }
+          reject(
+            new Error(
+              "postcodes.io: unexpected response: " + JSON.stringify(response)
+            )
+          );
+        })
+        .fail(function(jqXHR, textStatus, error) {
+          if (jqXHR.status === 404) {
+            resolve(null);
+          } else {
+            reject(
+              new Error("postcodes.io: " + textStatus + ": " + jqXHR.status)
+            );
+          }
+        });
+    });
+  }
+
+  //
+  // Form Handler
+  //
+  $(function() {
+    $("#addressForm").on("submit", function() {
+      if (!googleMaps) {
+        alert(
+          "Sorry, the Google Places API we need did not load. Please refresh and try again."
+        );
+        return false;
+      }
+
+      showModal();
+      try {
+        findAddresses(extractAddressesFromTextArea())
+          .tap(outputResults)
+          .map(findConstituencies, { concurrency: 1 })
+          .tap(outputResults)
+          .finally(hideModal);
+      } catch (e) {
+        alert("Sorry, failed to load addresses.");
+        hideModal();
+        console.log(e);
+      }
+      return false;
+    });
+
+    function extractAddressesFromTextArea() {
+      var lines = $("#addresses")
+        .text()
+        .split(/\r?\n/);
+      lines = lines.map(function(line) {
+        return line.trim();
+      });
+      return lines.filter(function(line) {
+        return line !== "";
+      });
+    }
+
+    function findAddresses(addresses) {
+      return BPromise.map(addresses, findAddress, {concurrency: 1});
+    }
+
+    function findAddress(address) {
+      updateModal("Looking up " + address);
+      return googleMaps
+        .findPlaceFromQueryAsync({
+          locationBias: "IP_BIAS",
+          fields: ["formatted_address", "place_id"],
+          query: address
+        })
+        .delay(DELAY)
+        .spread(processFindPlaceFromQueryResponse)
+        .catch(function(error) {
+          return {
+            address: address,
+            results: [],
+            status: error.toString()
+          };
+        });
+
+      function processFindPlaceFromQueryResponse(queryResults, status) {
+        var output = { address: address, results: [], status: status };
+        if (status === google.maps.places.PlacesServiceStatus.OK) {
+          output.results = BPromise.map(
+            queryResults,
+            processFindPlaceFromQueryResult,
+            { concurrency: 1 }
+          );
+        }
+        return BPromise.props(output);
+      }
+
+      function processFindPlaceFromQueryResult(queryResult) {
+        return BPromise.props({
+          formattedAddress: queryResult.formatted_address,
+          details: findAddressDetails(queryResult)
+        });
+      }
+    }
+
+    function findAddressDetails(queryResult) {
+      return googleMaps
+        .getDetailsAsync({
+          fields: ["address_components"],
+          placeId: queryResult.place_id
+        })
+        .delay(DELAY)
+        .spread(processGetDetailsResponse)
+        .catch(function(error) {
+          return {
+            status: error.toString()
+          };
+        });
+
+      function processGetDetailsResponse(result, status) {
+        var output = { postcode: null, status: status };
+        if (status === google.maps.places.PlacesServiceStatus.OK) {
+          output.postcode = findPostcodeFromAddressComponents(
+            result.address_components
+          );
+        }
+        return output;
+      }
+
+      function findPostcodeFromAddressComponents(components) {
+        var postCode;
+        function findPostcodeFromAddressComponent(component) {
+          if (component.types.indexOf("postal_code") >= 0) {
+            postCode = component.long_name;
+          }
+        }
+        components.forEach(findPostcodeFromAddressComponent);
+        return postCode;
+      }
+    }
+
+    function findConstituencies(addressData) {
+      updateModal("Finding constituency for " + addressData.address);
+
+      if (addressData.status === "OK" && addressData.results) {
+        addressData.results = BPromise.map(
+          addressData.results,
+          findResultConstituency,
+          { concurrency: 1 }
+        );
+      }
+
+      function findResultConstituency(result) {
+        if (result.details.status === "OK" && result.details.postcode) {
+          result.constituency = findConstituencyForPostcode(
+            result.details.postcode
+          ).delay(DELAY);
+        }
+
+        return BPromise.props(result);
+      }
+
+      return BPromise.props(addressData);
+    }
+
+    function outputResults(addressesData) {
+      var csv = [
+        ["address", "formatted_address", "postcode", "constituency", "status"]
+      ];
+      addressesData.forEach(outputAddress);
+      $("#output").text(csv.map(toTsvRow).join("\n"));
+
+      function outputAddress(addressData) {
+        if (addressData.results.length > 0) {
+          addressData.results.forEach(function outputAddressResult(result) {
+            var status = addressData.status + "-" + result.details.status;
+            csv.push([
+              addressData.address,
+              result.formattedAddress,
+              result.details.postcode,
+              result.constituency,
+              status
+            ]);
+          });
+        } else {
+          csv.push([
+            addressData.address,
+            addressData.formattedAddress,
+            null,
+            null,
+            addressData.status
+          ]);
+        }
+      }
+
+      function toTsvRow(row) {
+        return row
+          .map(function(cell) {
+            return JSON.stringify(cell);
+          })
+          .join("\t");
+      }
+    }
+
+    function showModal() {
+      $("#progressModal").modal("show");
+    }
+
+    function hideModal() {
+      $("#progressModal").modal("hide");
+    }
+
+    function updateModal(progress) {
+      $("#progressMessage").text(progress);
+    }
+  });
+
+  </script>
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.1.3/css/bootstrap.min.css" integrity="sha384-MCw98/SFnGE8fJT3GXwEOngsV7Zt27NXFoaoApmYm81iuXoPkFOJwJ8ERdknLPMO" crossorigin="anonymous">
+</head>
+<body>
+  <div class="container">
+    <h1>Address to Constituency Lookup</h1>
+    <form id="addressForm">
+      <div class="form-group">
+        <label for="addresses">Addresses</label>
+        <textarea class="form-control" id="addresses" rows="10">
+          81B Endell St, London
+          International House, 24 Holborn Viaduct, London
+          1 Church Street
+        </textarea>
+        <small id="addressesHelp" class="form-text text-muted">One address per line, please.</small>
+      </div>
+      <button type="submit" class="btn btn-primary">Submit</button>
+    </form>
+    <h2 class="mt-3">Output</h2>
+    <form id="outputForm">
+    <label for="output">Constituencies</label>
+    <textarea class="form-control" id="output" rows="10"></textarea>
+    <small id="addressesHelp" class="form-text text-muted">You can copy and paste this into Excel.</small>
+    </label>
+  </div>
+  <div id="placesServiceContainer"></div>
+  <div id="progressModal" class="modal fade" tabindex="-1" role="dialog" aria-labelledby="progressModalLabel" aria-hidden="true">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="progressModalLabel">Processing&hellip;</h5>
+        </div>
+        <div class="modal-body">
+          <p id="progressMessage">Loading&hellip;</p>
+        </div>
+      </div>
+    </div>
+  </div>
+  <script src="https://maps.googleapis.com/maps/api/js?key=TODOPASTEKEYHERE&libraries=places&callback=initialiseGoogleMaps"
+async defer></script>
+</body>
+</html>
